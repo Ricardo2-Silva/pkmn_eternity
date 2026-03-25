@@ -1,0 +1,322 @@
+# uncompyle6 version 3.9.3
+# Python bytecode version base 3.6 (3379)
+# Decompiled from: Python 3.6.6 (v3.6.6:4cf1f54eb7, Jun 27 2018, 03:37:03) [MSC v.1900 64 bit (AMD64)]
+# Embedded file name: pyglet\com.py
+"""Minimal Windows COM interface.
+
+Allows pyglet to use COM interfaces on Windows without comtypes.  Unlike
+comtypes, this module does not provide property interfaces, read typelibs,
+nice-ify return values.  We don't need anything that sophisticated to work with COM's.
+
+Interfaces should derive from pIUnknown if their implementation is returned by the COM.
+The Python COM interfaces are actually pointers to the implementation (take note
+when translating methods that take an interface as argument).
+(example: A Double Pointer is simply POINTER(MyInterface) as pInterface is already a POINTER.)
+
+Interfaces can define methods::
+
+    class IDirectSound8(com.pIUnknown):
+        _methods_ = [
+            ('CreateSoundBuffer', com.STDMETHOD()),
+            ('GetCaps', com.STDMETHOD(LPDSCAPS)),
+            ...
+        ]
+
+Only use STDMETHOD or METHOD for the method types (not ordinary ctypes
+function types).  The 'this' pointer is bound automatically... e.g., call::
+
+    device = IDirectSound8()
+    DirectSoundCreate8(None, ctypes.byref(device), None)
+
+    caps = DSCAPS()
+    device.GetCaps(caps)
+
+Because STDMETHODs use HRESULT as the return type, there is no need to check
+the return value.
+
+Don't forget to manually manage memory... call Release() when you're done with
+an interface.
+"""
+import sys, ctypes
+from pyglet.util import debug_print
+_debug_com = debug_print("debug_com")
+if sys.platform != "win32":
+    raise ImportError("pyglet.com requires a Windows build of Python")
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+     (
+      "Data1", ctypes.c_ulong),
+     (
+      "Data2", ctypes.c_ushort),
+     (
+      "Data3", ctypes.c_ushort),
+     (
+      "Data4", ctypes.c_ubyte * 8)]
+
+    def __init__(self, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8):
+        self.Data1 = l
+        self.Data2 = w1
+        self.Data3 = w2
+        self.Data4[:] = (b1, b2, b3, b4, b5, b6, b7, b8)
+
+    def __repr__(self):
+        b1, b2, b3, b4, b5, b6, b7, b8 = self.Data4
+        return "GUID(%x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x)" % (
+         self.Data1, self.Data2, self.Data3, b1, b2, b3, b4, b5, b6, b7, b8)
+
+    def __cmp__(self, other):
+        if isinstance(other, GUID):
+            return ctypes.cmp(bytes(self), bytes(other))
+        else:
+            return -1
+
+    def __eq__(self, other):
+        return isinstance(other, GUID) and bytes(self) == bytes(other)
+
+    def __hash__(self):
+        return hash(bytes(self))
+
+
+LPGUID = ctypes.POINTER(GUID)
+IID = GUID
+REFIID = ctypes.POINTER(IID)
+
+class METHOD:
+    __doc__ = "COM method."
+
+    def __init__(self, restype, *args):
+        self.restype = restype
+        self.argtypes = args
+
+    def get_field(self):
+        return (ctypes.WINFUNCTYPE)(self.restype, *self.argtypes)
+
+
+class STDMETHOD(METHOD):
+    __doc__ = "COM method with HRESULT return value."
+
+    def __init__(self, *args):
+        (super(STDMETHOD, self).__init__)(ctypes.HRESULT, *args)
+
+
+class COMMethodInstance:
+    __doc__ = "Binds a COM interface method."
+
+    def __init__(self, name, i, method):
+        self.name = name
+        self.i = i
+        self.method = method
+
+    def __get__(self, obj, tp):
+        if obj is not None:
+
+            def _call(*args):
+                if not _debug_com("COM: #{} IN {}({}, {})".format(self.i, self.name, obj.__class__.__name__, args)):
+                    raise AssertionError
+                else:
+                    ret = (self.method.get_field()(self.i, self.name))(obj, *args)
+                    assert _debug_com("COM: #{} OUT {}({}, {})".format(self.i, self.name, obj.__class__.__name__, args))
+                    assert _debug_com("COM: RETURN {}".format(ret))
+                return ret
+
+            return _call
+        raise AttributeError()
+
+
+class COMInterface(ctypes.Structure):
+    __doc__ = "Dummy struct to serve as the type of all COM pointers."
+    _fields_ = [
+     (
+      "lpVtbl", ctypes.c_void_p)]
+
+
+class InterfacePtrMeta(type(ctypes.POINTER(COMInterface))):
+    __doc__ = "Allows interfaces to be subclassed as ctypes POINTER and expects to be populated with data from a COM object.\n       TODO: Phase this out and properly use POINTER(Interface) where applicable.\n    "
+
+    def __new__(cls, name, bases, dct):
+        methods = []
+        for base in bases[::-1]:
+            methods.extend(base.__dict__.get("_methods_", ()))
+
+        methods.extend(dct.get("_methods_", ()))
+        for i, (n, method) in enumerate(methods):
+            dct[n] = COMMethodInstance(n, i, method)
+
+        dct["_type_"] = COMInterface
+        return super(InterfacePtrMeta, cls).__new__(cls, name, bases, dct)
+
+
+pInterface = InterfacePtrMeta(str("Interface"), (
+ ctypes.POINTER(COMInterface),), {"__doc__": "Base COM interface pointer."})
+
+class COMInterfaceMeta(type):
+    __doc__ = "This differs in the original as an implemented interface object, not a POINTER object.\n       Used when the user must implement their own functions within an interface rather than\n       being created and generated by the COM object itself. The types are automatically inserted in the ctypes type\n       cache so it can recognize the type arguments.\n    "
+
+    def __new__(mcs, name, bases, dct):
+        methods = dct.pop("_methods_", None)
+        cls = type.__new__(mcs, name, bases, dct)
+        if methods is not None:
+            cls._methods_ = methods
+        elif not bases:
+            _ptr_bases = (
+             cls, COMPointer)
+        else:
+            _ptr_bases = (
+             cls, ctypes.POINTER(bases[0]))
+        from ctypes import _pointer_type_cache
+        _pointer_type_cache[cls] = type(COMPointer)("POINTER({})".format(cls.__name__), _ptr_bases, {"__interface__": cls})
+        return cls
+
+    def __get_subclassed_methodcount(self):
+        """Returns the amount of COM methods in all subclasses to determine offset of methods.
+           Order must be exact from the source when calling COM methods.
+        """
+        try:
+            result = 0
+            for itf in self.mro()[1:-1]:
+                result += len(itf.__dict__["_methods_"])
+
+            return result
+        except KeyError as err:
+            name, = err.args
+            if name == "_methods_":
+                raise TypeError("Interface '{}' requires a _methods_ attribute.".format(itf.__name__))
+            raise
+
+
+class COMPointerMeta(type(ctypes.c_void_p), COMInterfaceMeta):
+    __doc__ = "Required to prevent metaclass conflicts with inheritance."
+
+
+class COMPointer(ctypes.c_void_p, metaclass=COMPointerMeta):
+    __doc__ = "COM Pointer base, could use c_void_p but need to override from_param ."
+
+    @classmethod
+    def from_param(cls, obj):
+        """Allows obj to return ctypes pointers, even if it's base is not a ctype.
+           In this case, all we simply want is a ctypes pointer matching the cls interface from the obj.
+        """
+        if obj is None:
+            return
+        try:
+            ptr_dct = obj._pointers
+        except AttributeError:
+            raise Exception("Interface method argument specified incorrectly, or passed wrong argument.", cls)
+        else:
+            try:
+                return ptr_dct[cls.__interface__]
+            except KeyError:
+                raise TypeError("Interface {} doesn't have a pointer in this class.".format(cls.__name__))
+
+
+def _missing_impl(interface_name, method_name):
+    """Functions that are not implemented use this to prevent errors when called."""
+
+    def missing_cb_func(*args):
+        """Return E_NOTIMPL because the method is not implemented."""
+        assert _debug_com("Undefined method: {0} was called in interface: {1}".format(method_name, interface_name))
+        return 0
+
+    return missing_cb_func
+
+
+def _found_impl(interface_name, method_name, method_func):
+    """If a method was found in class, we can set it as a callback."""
+
+    def cb_func(*args, **kw):
+        try:
+            result = method_func(*args, **kw)
+        except Exception as err:
+            raise err
+
+        if not result:
+            return 0
+        else:
+            return result
+
+    return cb_func
+
+
+def _make_callback_func(interface, name, method_func):
+    """Create a callback function for ctypes if possible."""
+    if method_func is None:
+        return _missing_impl(interface, name)
+    else:
+        return _found_impl(interface, name, method_func)
+
+
+_cached_structures = {}
+
+def create_vtbl_structure(fields, interface):
+    """Create virtual table structure with fields for use in COM's."""
+    try:
+        return _cached_structures[fields]
+    except KeyError:
+        Vtbl = type("Vtbl_{}".format(interface.__name__), (ctypes.Structure,), {"_fields_": fields})
+        _cached_structures[fields] = Vtbl
+        return Vtbl
+
+
+class COMObject:
+    __doc__ = "A base class for defining a COM object for use with callbacks and custom implementations."
+    _interfaces_ = []
+
+    def __new__(cls, *args, **kw):
+        new_cls = super(COMObject, cls).__new__(cls)
+        assert len(cls._interfaces_) > 0, "Atleast one interface must be defined to use a COMObject."
+        new_cls._pointers = {}
+        new_cls._COMObject__create_interface_pointers()
+        return new_cls
+
+    def __create_interface_pointers(cls):
+        """Create a custom ctypes structure to handle COM functions in a COM Object."""
+        interfaces = tuple(cls._interfaces_)
+        for itf in interfaces[::-1]:
+            methods = []
+            fields = []
+            for interface in itf.__mro__[-2::-1]:
+                for method in interface._methods_:
+                    name, com_method = method
+                    found_method = getattr(cls, name, None)
+                    mth = _make_callback_func(itf.__name__, name, found_method)
+                    proto = (ctypes.WINFUNCTYPE)(com_method.restype, *com_method.argtypes)
+                    fields.append((name, proto))
+                    methods.append(proto(mth))
+
+            itf_structure = create_vtbl_structure(tuple(fields), interface)
+            vtbl = itf_structure(*methods)
+            cls._pointers[itf] = ctypes.pointer(ctypes.pointer(vtbl))
+
+    @property
+    def pointers(self):
+        """Returns pointers to the implemented interfaces in this COMObject.  Read-only.
+
+        :type: dict
+        """
+        return self._pointers
+
+
+class Interface(metaclass=COMInterfaceMeta):
+    _methods_ = []
+
+
+class IUnknown(metaclass=COMInterfaceMeta):
+    __doc__ = "These methods are not implemented by default yet. Strictly for COM method ordering."
+    _methods_ = [
+     (
+      "QueryInterface", STDMETHOD(ctypes.c_void_p, REFIID, ctypes.c_void_p)),
+     (
+      "AddRef", METHOD(ctypes.c_int, ctypes.c_void_p)),
+     (
+      "Release", METHOD(ctypes.c_int, ctypes.c_void_p))]
+
+
+class pIUnknown(pInterface):
+    _methods_ = [
+     (
+      "QueryInterface", STDMETHOD(REFIID, ctypes.c_void_p)),
+     (
+      "AddRef", METHOD(ctypes.c_int)),
+     (
+      "Release", METHOD(ctypes.c_int))]
