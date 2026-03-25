@@ -1,0 +1,360 @@
+# uncompyle6 version 3.9.3
+# Python bytecode version base 3.6 (3379)
+# Decompiled from: Python 3.6.6 (v3.6.6:4cf1f54eb7, Jun 27 2018, 03:37:03) [MSC v.1900 64 bit (AMD64)]
+# Embedded file name: twisted\python\components.py
+"""
+Component architecture for Twisted, based on Zope3 components.
+
+Using the Zope3 API directly is strongly recommended. Everything
+you need is in the top-level of the zope.interface package, e.g.::
+
+   from zope.interface import Interface, implementer
+
+   class IFoo(Interface):
+       pass
+
+   @implementer(IFoo)
+   class Foo:
+       pass
+
+   print(IFoo.implementedBy(Foo)) # True
+   print(IFoo.providedBy(Foo())) # True
+
+L{twisted.python.components.registerAdapter} from this module may be used to
+add to Twisted's global adapter registry.
+
+L{twisted.python.components.proxyForInterface} is a factory for classes
+which allow access to only the parts of another class defined by a specified
+interface.
+"""
+from __future__ import division, absolute_import, print_function
+from zope.interface import interface, declarations
+from zope.interface.adapter import AdapterRegistry
+from twisted.python.compat import NativeStringIO
+from twisted.python import reflect
+from twisted.python._oldstyle import _oldStyle
+globalRegistry = AdapterRegistry()
+ALLOW_DUPLICATES = 0
+
+def registerAdapter(adapterFactory, origInterface, *interfaceClasses):
+    """Register an adapter class.
+
+    An adapter class is expected to implement the given interface, by
+    adapting instances implementing 'origInterface'. An adapter class's
+    __init__ method should accept one parameter, an instance implementing
+    'origInterface'.
+    """
+    global ALLOW_DUPLICATES
+    self = globalRegistry
+    assert interfaceClasses, "You need to pass an Interface"
+    if not isinstance(origInterface, interface.InterfaceClass):
+        origInterface = declarations.implementedBy(origInterface)
+    for interfaceClass in interfaceClasses:
+        factory = self.registered([origInterface], interfaceClass)
+        if factory is not None and not ALLOW_DUPLICATES:
+            raise ValueError("an adapter (%s) was already registered." % (factory,))
+
+    for interfaceClass in interfaceClasses:
+        self.register([origInterface], interfaceClass, "", adapterFactory)
+
+
+def getAdapterFactory(fromInterface, toInterface, default):
+    """Return registered adapter for a given class and interface.
+
+    Note that is tied to the *Twisted* global registry, and will
+    thus not find adapters registered elsewhere.
+    """
+    self = globalRegistry
+    if not isinstance(fromInterface, interface.InterfaceClass):
+        fromInterface = declarations.implementedBy(fromInterface)
+    factory = self.lookup1(fromInterface, toInterface)
+    if factory is None:
+        factory = default
+    return factory
+
+
+def _addHook(registry):
+    """
+    Add an adapter hook which will attempt to look up adapters in the given
+    registry.
+
+    @type registry: L{zope.interface.adapter.AdapterRegistry}
+
+    @return: The hook which was added, for later use with L{_removeHook}.
+    """
+    lookup = registry.lookup1
+
+    def _hook(iface, ob):
+        factory = lookup(declarations.providedBy(ob), iface)
+        if factory is None:
+            return
+        else:
+            return factory(ob)
+
+    interface.adapter_hooks.append(_hook)
+    return _hook
+
+
+def _removeHook(hook):
+    """
+    Remove a previously added adapter hook.
+
+    @param hook: An object previously returned by a call to L{_addHook}.  This
+        will be removed from the list of adapter hooks.
+    """
+    interface.adapter_hooks.remove(hook)
+
+
+_addHook(globalRegistry)
+
+def getRegistry():
+    """Returns the Twisted global
+    C{zope.interface.adapter.AdapterRegistry} instance.
+    """
+    return globalRegistry
+
+
+CannotAdapt = TypeError
+
+@_oldStyle
+class Adapter:
+    __doc__ = "I am the default implementation of an Adapter for some interface.\n\n    This docstring contains a limerick, by popular demand::\n\n        Subclassing made Zope and TR\n        much harder to work with by far.\n            So before you inherit,\n            be sure to declare it\n        Adapter, not PyObject*\n\n    @cvar temporaryAdapter: If this is True, the adapter will not be\n          persisted on the Componentized.\n    @cvar multiComponent: If this adapter is persistent, should it be\n          automatically registered for all appropriate interfaces.\n    "
+    temporaryAdapter = 0
+    multiComponent = 1
+
+    def __init__(self, original):
+        """Set my 'original' attribute to be the object I am adapting.
+        """
+        self.original = original
+
+    def __conform__(self, interface):
+        """
+        I forward __conform__ to self.original if it has it, otherwise I
+        simply return None.
+        """
+        if hasattr(self.original, "__conform__"):
+            return self.original.__conform__(interface)
+        else:
+            return
+
+    def isuper(self, iface, adapter):
+        """
+        Forward isuper to self.original
+        """
+        return self.original.isuper(iface, adapter)
+
+
+@_oldStyle
+class Componentized:
+    __doc__ = "I am a mixin to allow you to be adapted in various ways persistently.\n\n    I define a list of persistent adapters.  This is to allow adapter classes\n    to store system-specific state, and initialized on demand.  The\n    getComponent method implements this.  You must also register adapters for\n    this class for the interfaces that you wish to pass to getComponent.\n\n    Many other classes and utilities listed here are present in Zope3; this one\n    is specific to Twisted.\n    "
+    persistenceVersion = 1
+
+    def __init__(self):
+        self._adapterCache = {}
+
+    def locateAdapterClass(self, klass, interfaceClass, default):
+        return getAdapterFactory(klass, interfaceClass, default)
+
+    def setAdapter(self, interfaceClass, adapterClass):
+        """
+        Cache a provider for the given interface, by adapting C{self} using
+        the given adapter class.
+        """
+        self.setComponent(interfaceClass, adapterClass(self))
+
+    def addAdapter(self, adapterClass, ignoreClass=0):
+        """Utility method that calls addComponent.  I take an adapter class and
+        instantiate it with myself as the first argument.
+
+        @return: The adapter instantiated.
+        """
+        adapt = adapterClass(self)
+        self.addComponent(adapt, ignoreClass)
+        return adapt
+
+    def setComponent(self, interfaceClass, component):
+        """
+        Cache a provider of the given interface.
+        """
+        self._adapterCache[reflect.qual(interfaceClass)] = component
+
+    def addComponent(self, component, ignoreClass=0):
+        """
+        Add a component to me, for all appropriate interfaces.
+
+        In order to determine which interfaces are appropriate, the component's
+        provided interfaces will be scanned.
+
+        If the argument 'ignoreClass' is True, then all interfaces are
+        considered appropriate.
+
+        Otherwise, an 'appropriate' interface is one for which its class has
+        been registered as an adapter for my class according to the rules of
+        getComponent.
+        """
+        for iface in declarations.providedBy(component):
+            if ignoreClass or self.locateAdapterClass(self.__class__, iface, None) == component.__class__:
+                self._adapterCache[reflect.qual(iface)] = component
+
+    def unsetComponent(self, interfaceClass):
+        """Remove my component specified by the given interface class."""
+        del self._adapterCache[reflect.qual(interfaceClass)]
+
+    def removeComponent(self, component):
+        """
+        Remove the given component from me entirely, for all interfaces for which
+        it has been registered.
+
+        @return: a list of the interfaces that were removed.
+        """
+        l = []
+        for k, v in list(self._adapterCache.items()):
+            if v is component:
+                del self._adapterCache[k]
+                l.append(reflect.namedObject(k))
+
+        return l
+
+    def getComponent(self, interface, default=None):
+        """Create or retrieve an adapter for the given interface.
+
+        If such an adapter has already been created, retrieve it from the cache
+        that this instance keeps of all its adapters.  Adapters created through
+        this mechanism may safely store system-specific state.
+
+        If you want to register an adapter that will be created through
+        getComponent, but you don't require (or don't want) your adapter to be
+        cached and kept alive for the lifetime of this Componentized object,
+        set the attribute 'temporaryAdapter' to True on your adapter class.
+
+        If you want to automatically register an adapter for all appropriate
+        interfaces (with addComponent), set the attribute 'multiComponent' to
+        True on your adapter class.
+        """
+        k = reflect.qual(interface)
+        if k in self._adapterCache:
+            return self._adapterCache[k]
+        else:
+            adapter = interface.__adapt__(self)
+            if adapter is not None:
+                if not (hasattr(adapter, "temporaryAdapter") and adapter.temporaryAdapter):
+                    self._adapterCache[k] = adapter
+                    if hasattr(adapter, "multiComponent"):
+                        if adapter.multiComponent:
+                            self.addComponent(adapter)
+            if adapter is None:
+                return default
+            return adapter
+
+    def __conform__(self, interface):
+        return self.getComponent(interface)
+
+
+class ReprableComponentized(Componentized):
+
+    def __init__(self):
+        Componentized.__init__(self)
+
+    def __repr__(self):
+        from pprint import pprint
+        sio = NativeStringIO()
+        pprint(self._adapterCache, sio)
+        return sio.getvalue()
+
+
+def proxyForInterface(iface, originalAttribute='original'):
+    """
+    Create a class which proxies all method calls which adhere to an interface
+    to another provider of that interface.
+
+    This function is intended for creating specialized proxies. The typical way
+    to use it is by subclassing the result::
+
+      class MySpecializedProxy(proxyForInterface(IFoo)):
+          def someInterfaceMethod(self, arg):
+              if arg == 3:
+                  return 3
+              return self.original.someInterfaceMethod(arg)
+
+    @param iface: The Interface to which the resulting object will conform, and
+        which the wrapped object must provide.
+
+    @param originalAttribute: name of the attribute used to save the original
+        object in the resulting class. Default to C{original}.
+    @type originalAttribute: C{str}
+
+    @return: A class whose constructor takes the original object as its only
+        argument. Constructing the class creates the proxy.
+    """
+
+    def __init__(self, original):
+        setattr(self, originalAttribute, original)
+
+    contents = {"__init__": __init__}
+    for name in iface:
+        contents[name] = _ProxyDescriptor(name, originalAttribute)
+
+    proxy = type("(Proxy for %s)" % (
+     reflect.qual(iface),), (object,), contents)
+    declarations.classImplements(proxy, iface)
+    return proxy
+
+
+class _ProxiedClassMethod(object):
+    __doc__ = "\n    A proxied class method.\n\n    @ivar methodName: the name of the method which this should invoke when\n        called.\n    @type methodName: L{str}\n\n    @ivar __name__: The name of the method being proxied (the same as\n        C{methodName}).\n    @type __name__: L{str}\n\n    @ivar originalAttribute: name of the attribute of the proxy where the\n        original object is stored.\n    @type originalAttribute: L{str}\n    "
+
+    def __init__(self, methodName, originalAttribute):
+        self.methodName = self.__name__ = methodName
+        self.originalAttribute = originalAttribute
+
+    def __call__(self, oself, *args, **kw):
+        """
+        Invoke the specified L{methodName} method of the C{original} attribute
+        for proxyForInterface.
+
+        @param oself: an instance of a L{proxyForInterface} object.
+
+        @return: the result of the underlying method.
+        """
+        original = getattr(oself, self.originalAttribute)
+        actualMethod = getattr(original, self.methodName)
+        return actualMethod(*args, **kw)
+
+
+class _ProxyDescriptor(object):
+    __doc__ = "\n    A descriptor which will proxy attribute access, mutation, and\n    deletion to the L{_ProxyDescriptor.originalAttribute} of the\n    object it is being accessed from.\n\n    @ivar attributeName: the name of the attribute which this descriptor will\n        retrieve from instances' C{original} attribute.\n    @type attributeName: C{str}\n\n    @ivar originalAttribute: name of the attribute of the proxy where the\n        original object is stored.\n    @type originalAttribute: C{str}\n    "
+
+    def __init__(self, attributeName, originalAttribute):
+        self.attributeName = attributeName
+        self.originalAttribute = originalAttribute
+
+    def __get__(self, oself, type=None):
+        """
+        Retrieve the C{self.attributeName} property from I{oself}.
+        """
+        if oself is None:
+            return _ProxiedClassMethod(self.attributeName, self.originalAttribute)
+        else:
+            original = getattr(oself, self.originalAttribute)
+            return getattr(original, self.attributeName)
+
+    def __set__(self, oself, value):
+        """
+        Set the C{self.attributeName} property of I{oself}.
+        """
+        original = getattr(oself, self.originalAttribute)
+        setattr(original, self.attributeName, value)
+
+    def __delete__(self, oself):
+        """
+        Delete the C{self.attributeName} property of I{oself}.
+        """
+        original = getattr(oself, self.originalAttribute)
+        delattr(original, self.attributeName)
+
+
+__all__ = [
+ 'registerAdapter', 'getAdapterFactory', 
+ 'Adapter', 'Componentized', 'ReprableComponentized', 
+ 'getRegistry', 
+ 'proxyForInterface']
