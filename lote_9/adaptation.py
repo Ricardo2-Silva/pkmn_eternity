@@ -1,0 +1,345 @@
+# uncompyle6 version 3.9.3
+# Python bytecode version base 3.6 (3379)
+# Decompiled from: Python 3.6.6 (v3.6.6:4cf1f54eb7, Jun 27 2018, 03:37:03) [MSC v.1900 64 bit (AMD64)]
+# Embedded file name: pyglet\media\drivers\directsound\adaptation.py
+import math, ctypes
+from . import interface
+from pyglet.util import debug_print
+from pyglet.media.events import MediaEvent
+from pyglet.media.mediathreads import PlayerWorkerThread
+from pyglet.media.drivers.base import AbstractAudioDriver, AbstractAudioPlayer
+from pyglet.media.drivers.listener import AbstractListener
+_debug = debug_print("debug_media")
+
+def _convert_coordinates(coordinates):
+    x, y, z = coordinates
+    return (x, y, -z)
+
+
+def _gain2db(gain):
+    """
+    Convert linear gain in range [0.0, 1.0] to 100ths of dB.
+
+    Power gain = P1/P2
+    dB = 2 log(P1/P2)
+    dB * 100 = 1000 * log(power gain)
+    """
+    if gain <= 0:
+        return -10000
+    else:
+        return max(-10000, min(int(1000 * math.log2(min(gain, 1))), 0))
+
+
+def _db2gain(db):
+    """Convert 100ths of dB to linear gain."""
+    return math.pow(10.0, float(db) / 1000.0)
+
+
+class DirectSoundAudioPlayer(AbstractAudioPlayer):
+    _cone_inner_angle = 360
+    _cone_outer_angle = 360
+    min_buffer_size = 9600
+
+    def __init__(self, driver, ds_driver, source, player):
+        super(DirectSoundAudioPlayer, self).__init__(source, player)
+        self.driver = driver
+        self._ds_driver = ds_driver
+        self._playing = False
+        self._audiodata_buffer = None
+        self._write_cursor = 0
+        self._play_cursor = 0
+        self._eos_cursor = None
+        self._play_cursor_ring = 0
+        self._write_cursor_ring = 0
+        self._events = []
+        self._timestamps = []
+        audio_format = source.audio_format
+        self._ds_buffer = self._ds_driver.create_buffer(audio_format)
+        self._buffer_size = self._ds_buffer.buffer_size
+        self._ds_buffer.current_position = 0
+        self.refill(self._buffer_size)
+
+    def __del__(self):
+        self.driver._ds_driver._native_dsound.Release()
+
+    def delete(self):
+        self.driver.worker.remove(self)
+
+    def play(self):
+        if not _debug("DirectSound play"):
+            raise AssertionError
+        else:
+            self.driver.worker.add(self)
+            if not self._playing:
+                self._get_audiodata()
+                self._playing = True
+                self._ds_buffer.play()
+            assert _debug("return DirectSound play")
+
+    def stop(self):
+        if not _debug("DirectSound stop"):
+            raise AssertionError
+        else:
+            self.driver.worker.remove(self)
+            if self._playing:
+                self._playing = False
+                self._ds_buffer.stop()
+            assert _debug("return DirectSound stop")
+
+    def clear(self):
+        assert _debug("DirectSound clear")
+        super(DirectSoundAudioPlayer, self).clear()
+        self._ds_buffer.current_position = 0
+        self._play_cursor_ring = self._write_cursor_ring = 0
+        self._play_cursor = self._write_cursor
+        self._eos_cursor = None
+        self._audiodata_buffer = None
+        del self._events[:]
+        del self._timestamps[:]
+
+    def refill(self, write_size):
+        while write_size > 0:
+            assert _debug("refill, write_size =", write_size)
+            audio_data = self._get_audiodata()
+            if audio_data is not None:
+                assert _debug("write", audio_data.length)
+                length = min(write_size, audio_data.length)
+                self.write(audio_data, length)
+                write_size -= length
+            else:
+                assert _debug("write silence")
+                self.write(None, write_size)
+                write_size = 0
+
+    def _has_underrun(self):
+        return self._eos_cursor is not None and self._play_cursor > self._eos_cursor
+
+    def _dispatch_new_event(self, event_name):
+        MediaEvent(0, event_name)._sync_dispatch_to_player(self.player)
+
+    def _get_audiodata(self):
+        if self._audiodata_buffer is None or self._audiodata_buffer.length == 0:
+            self._get_new_audiodata()
+        return self._audiodata_buffer
+
+    def _get_new_audiodata(self):
+        if not _debug("Getting new audio data buffer."):
+            raise AssertionError
+        else:
+            compensation_time = self.get_audio_time_diff()
+            self._audiodata_buffer = self.source.get_audio_data(self._buffer_size, compensation_time)
+            if self._audiodata_buffer is not None:
+                assert _debug("New audio data available: {} bytes".format(self._audiodata_buffer.length))
+                if self._eos_cursor is not None:
+                    self._move_write_cursor_after_eos()
+                self._add_audiodata_events(self._audiodata_buffer)
+                self._add_audiodata_timestamp(self._audiodata_buffer)
+                self._eos_cursor = None
+            elif self._eos_cursor is None:
+                assert _debug("No more audio data.")
+                self._eos_cursor = self._write_cursor
+
+    def _move_write_cursor_after_eos(self):
+        if self._play_cursor < self._eos_cursor:
+            cursor_diff = self._write_cursor - self._eos_cursor
+            assert _debug("Moving cursor back", cursor_diff)
+            self._write_cursor = self._eos_cursor
+            self._write_cursor_ring -= cursor_diff
+            self._write_cursor_ring %= self._buffer_size
+        else:
+            cursor_diff = self._play_cursor - self._eos_cursor
+            assert _debug("Moving cursor back", cursor_diff)
+            self._write_cursor = self._play_cursor
+            self._write_cursor_ring -= cursor_diff
+            self._write_cursor_ring %= self._buffer_size
+
+    def _add_audiodata_events(self, audio_data):
+        for event in audio_data.events:
+            event_cursor = self._write_cursor + event.timestamp * self.source.audio_format.bytes_per_second
+            assert _debug("Adding event", event, "at", event_cursor)
+            self._events.append((event_cursor, event))
+
+    def _add_audiodata_timestamp(self, audio_data):
+        ts_cursor = self._write_cursor + audio_data.length
+        self._timestamps.append((
+         ts_cursor, audio_data.timestamp + audio_data.duration))
+
+    def update_play_cursor(self):
+        play_cursor_ring = self._ds_buffer.current_position.play_cursor
+        if play_cursor_ring < self._play_cursor_ring:
+            self._play_cursor += self._buffer_size - self._play_cursor_ring
+            self._play_cursor_ring = 0
+        self._play_cursor += play_cursor_ring - self._play_cursor_ring
+        self._play_cursor_ring = play_cursor_ring
+        self._dispatch_pending_events()
+        self._cleanup_timestamps()
+        self._check_underrun()
+
+    def _dispatch_pending_events(self):
+        pending_events = []
+        while self._events and self._events[0][0] <= self._play_cursor:
+            _, event = self._events.pop(0)
+            pending_events.append(event)
+
+        if not _debug("Dispatching pending events: {}".format(pending_events)):
+            raise AssertionError
+        elif not _debug("Remaining events: {}".format(self._events)):
+            raise AssertionError
+        for event in pending_events:
+            event._sync_dispatch_to_player(self.player)
+
+    def _cleanup_timestamps(self):
+        while self._timestamps and self._timestamps[0][0] < self._play_cursor:
+            del self._timestamps[0]
+
+    def _check_underrun(self):
+        if self._playing:
+            if self._has_underrun():
+                assert _debug("underrun, stopping")
+                self.stop()
+                self._dispatch_new_event("on_eos")
+
+    def get_write_size(self):
+        self.update_play_cursor()
+        play_cursor = self._play_cursor
+        write_cursor = self._write_cursor
+        return self._buffer_size - max(write_cursor - play_cursor, 0)
+
+    def write(self, audio_data, length):
+        if length == 0:
+            return 0
+        else:
+            write_ptr = self._ds_buffer.lock(self._write_cursor_ring, length)
+            assert 0 < length <= self._buffer_size
+            assert length == write_ptr.audio_length_1.value + write_ptr.audio_length_2.value
+        if audio_data:
+            ctypes.memmove(write_ptr.audio_ptr_1, audio_data.data, write_ptr.audio_length_1.value)
+            audio_data.consume(write_ptr.audio_length_1.value, self.source.audio_format)
+            if write_ptr.audio_length_2.value > 0:
+                ctypes.memmove(write_ptr.audio_ptr_2, audio_data.data, write_ptr.audio_length_2.value)
+                audio_data.consume(write_ptr.audio_length_2.value, self.source.audio_format)
+        elif self.source.audio_format.sample_size == 8:
+            c = 128
+        else:
+            c = 0
+        ctypes.memset(write_ptr.audio_ptr_1, c, write_ptr.audio_length_1.value)
+        if write_ptr.audio_length_2.value > 0:
+            ctypes.memset(write_ptr.audio_ptr_2, c, write_ptr.audio_length_2.value)
+        self._ds_buffer.unlock(write_ptr)
+        self._write_cursor += length
+        self._write_cursor_ring += length
+        self._write_cursor_ring %= self._buffer_size
+
+    def get_time(self):
+        self.update_play_cursor()
+        if self._timestamps:
+            cursor, ts = self._timestamps[0]
+            result = ts + (self._play_cursor - cursor) / float(self.source.audio_format.bytes_per_second)
+        else:
+            result = None
+        return result
+
+    def set_volume(self, volume):
+        self._ds_buffer.volume = _gain2db(volume)
+
+    def set_position(self, position):
+        if self._ds_buffer.is3d:
+            self._ds_buffer.position = _convert_coordinates(position)
+
+    def set_min_distance(self, min_distance):
+        if self._ds_buffer.is3d:
+            self._ds_buffer.min_distance = min_distance
+
+    def set_max_distance(self, max_distance):
+        if self._ds_buffer.is3d:
+            self._ds_buffer.max_distance = max_distance
+
+    def set_pitch(self, pitch):
+        frequency = int(pitch * self.source.audio_format.sample_rate)
+        self._ds_buffer.frequency = frequency
+
+    def set_cone_orientation(self, cone_orientation):
+        if self._ds_buffer.is3d:
+            self._ds_buffer.cone_orientation = _convert_coordinates(cone_orientation)
+
+    def set_cone_inner_angle(self, cone_inner_angle):
+        if self._ds_buffer.is3d:
+            self._cone_inner_angle = int(cone_inner_angle)
+            self._set_cone_angles()
+
+    def set_cone_outer_angle(self, cone_outer_angle):
+        if self._ds_buffer.is3d:
+            self._cone_outer_angle = int(cone_outer_angle)
+            self._set_cone_angles()
+
+    def _set_cone_angles(self):
+        inner = min(self._cone_inner_angle, self._cone_outer_angle)
+        outer = max(self._cone_inner_angle, self._cone_outer_angle)
+        self._ds_buffer.set_cone_angles(inner, outer)
+
+    def set_cone_outer_gain(self, cone_outer_gain):
+        if self._ds_buffer.is3d:
+            volume = _gain2db(cone_outer_gain)
+            self._ds_buffer.cone_outside_volume = volume
+
+    def prefill_audio(self):
+        write_size = self.get_write_size()
+        self.refill(write_size)
+
+
+class DirectSoundDriver(AbstractAudioDriver):
+
+    def __init__(self):
+        self._ds_driver = interface.DirectSoundDriver()
+        self._ds_listener = self._ds_driver.create_listener()
+        if not self._ds_driver is not None:
+            raise AssertionError
+        elif not self._ds_listener is not None:
+            raise AssertionError
+        self.worker = PlayerWorkerThread()
+        self.worker.start()
+
+    def __del__(self):
+        self.delete()
+
+    def create_audio_player(self, source, player):
+        assert self._ds_driver is not None
+        self._ds_driver._native_dsound.AddRef()
+        return DirectSoundAudioPlayer(self, self._ds_driver, source, player)
+
+    def get_listener(self):
+        if not self._ds_driver is not None:
+            raise AssertionError
+        elif not self._ds_listener is not None:
+            raise AssertionError
+        return DirectSoundListener(self._ds_listener, self._ds_driver.primary_buffer)
+
+    def delete(self):
+        self.worker.stop()
+        self._ds_listener = None
+
+
+class DirectSoundListener(AbstractListener):
+
+    def __init__(self, ds_listener, ds_buffer):
+        self._ds_listener = ds_listener
+        self._ds_buffer = ds_buffer
+
+    def _set_volume(self, volume):
+        self._volume = volume
+        self._ds_buffer.volume = _gain2db(volume)
+
+    def _set_position(self, position):
+        self._position = position
+        self._ds_listener.position = _convert_coordinates(position)
+
+    def _set_forward_orientation(self, orientation):
+        self._forward_orientation = orientation
+        self._set_orientation()
+
+    def _set_up_orientation(self, orientation):
+        self._up_orientation = orientation
+        self._set_orientation()
+
+    def _set_orientation(self):
+        self._ds_listener.orientation = _convert_coordinates(self._forward_orientation) + _convert_coordinates(self._up_orientation)
